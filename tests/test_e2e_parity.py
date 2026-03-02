@@ -598,6 +598,69 @@ def test_voice_clone_icl_prefix_parity_fast_path(parity_fixture):
     assert torch.equal(upstream_codes[0], fast_codes_cpu[0])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required.")
+def test_instruct_prepends_tokens_to_voice_clone(parity_fixture):
+    """instruct= should prepend exactly instruct_len tokens to the talker input embeds,
+    leaving the suffix (text + codec part) byte-for-byte identical to the no-instruct case.
+    """
+    fast = parity_fixture["fast"]
+
+    ref_audio = "ref_audio.wav"
+    text = "Short parity test."
+    language = "English"
+    instruct_str = "Please speak in a slow, calm tone."
+
+    with torch.inference_mode():
+        _, _, _, tie_base, tam_base, _, _, _ = fast._prepare_generation(
+            text, ref_audio, "", language=language, non_streaming_mode=False
+        )
+        _, _, _, tie_inst, tam_inst, _, _, _ = fast._prepare_generation(
+            text, ref_audio, "", language=language, non_streaming_mode=False,
+            instruct=instruct_str,
+        )
+
+    instruct_ids = fast.model._tokenize_texts([fast.model._build_instruct_text(instruct_str)])[0]
+    instruct_len = instruct_ids.shape[1]
+
+    # instruct tokens are prepended — sequence grows by exactly instruct_len
+    assert tie_inst.shape[1] == tie_base.shape[1] + instruct_len
+    assert tam_inst.shape[1] == tam_base.shape[1] + instruct_len
+
+    # the suffix (everything after the instruct prefix) is unchanged
+    assert torch.equal(tie_inst[:, instruct_len:], tie_base)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required.")
+def test_instruct_changes_generation_output(parity_fixture):
+    """Passing instruct= must produce different codec tokens than not passing it,
+    confirming the instruction propagates through the full decode loop.
+    """
+    _seed_all(0)
+
+    fast = parity_fixture["fast"]
+
+    ref_audio = "ref_audio.wav"
+    text = "Short parity test."
+    language = "English"
+
+    with torch.inference_mode():
+        wav_base, _ = fast.generate_voice_clone(
+            text=text, language=language, ref_audio=ref_audio, ref_text="",
+            max_new_tokens=32, do_sample=False, top_k=0, top_p=1.0, temperature=1.0,
+            repetition_penalty=1.0,
+        )
+        wav_inst, _ = fast.generate_voice_clone(
+            text=text, language=language, ref_audio=ref_audio, ref_text="",
+            max_new_tokens=32, do_sample=False, top_k=0, top_p=1.0, temperature=1.0,
+            repetition_penalty=1.0,
+            instruct="Please speak very slowly and with a deep voice.",
+        )
+
+    assert not torch.equal(
+        torch.tensor(wav_base[0]), torch.tensor(wav_inst[0])
+    ), "instruct had no effect on the generated audio"
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for ICL parity test.")
 def test_icl_build_talker_inputs_outside_inference_mode(parity_fixture):
     """Regression test: _build_talker_inputs_local must work with ICL ref_code tensors
